@@ -1,0 +1,58 @@
+services:
+  mysql:
+    image: mysql:8
+    container_name: authzen-db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: authzen
+      MYSQL_USER: user
+      MYSQL_PASSWORD: password
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - mynetwork
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: authzen-backend
+    restart: always
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/authzen?useSSL=false&allowPublicKeyRetrieval=true
+      SPRING_DATASOURCE_USERNAME: user
+      SPRING_DATASOURCE_PASSWORD: password
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mysql
+    networks:
+      - mynetwork
+    env_file:
+      - .env.example.docker
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: authzen-tests
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/authzen?useSSL=false&allowPublicKeyRetrieval=true
+      SPRING_DATASOURCE_USERNAME: user
+      SPRING_DATASOURCE_PASSWORD: password
+    depends_on:
+      - mysql
+    networks:
+      - mynetwork
+    command: [ "mvn", "test" ]
+volumes:
+  mysql_data:
+
+networks:
+  mynetwork:
+    driver: bridge
+
+

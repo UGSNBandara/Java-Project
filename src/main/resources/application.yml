@@ -1,0 +1,68 @@
+spring:
+  application:
+    name: ${SPRING_APPLICATION_NAME}
+  datasource:
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+    database-platform: org.hibernate.dialect.MySQL8Dialect
+  security:
+    user:
+      name:  ${ADMIN_USERNAME}
+      password:  ${ADMIN_PASSWORD}
+  mail:
+    host: ${MAIL_HOST}
+    port: ${MAIL_PORT}
+    username: ${MAIL_USERNAME}
+    password: ${MAIL_PASSWORD}
+    protocol: smtp
+    tls: true
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+            required: true
+  web:
+    resources:
+      static-locations: classpath:/static/
+
+jwt:
+  secret: ${JWT_SECRET}
+  access-token:
+    expiry-ms: ${JWT_ACCESS_EXPIRATION}
+  refresh-token:
+    expiry-ms: ${JWT_REFRESH_EXPIRATION}
+
+server:
+  port: ${SERVER_PORT}
+
+email:
+  from: ${EMAIL_FROM}
+
+github:
+  client-id: ${GITHUB_CLIENT_ID}
+  client-secret: ${GITHUB_CLIENT_SECRET}
+  redirect-uri: ${GITHUB_REDIRECT_URI}
+
+admin:
+  email: ${ADMIN_EMAIL}
+  username: ${ADMIN_USERNAME}
+  password: ${ADMIN_PASSWORD}
+
+
+springdoc:
+  api-docs:
+    enabled: true
+    path: /v3/api-docs
+  swagger-ui:
+    enabled: true
+    path: /swagger-ui.html
+    operationsSorter: alpha
+    tagsSorter: alpha
+    display-request-duration: true
