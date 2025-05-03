@@ -38,6 +38,7 @@ public class AdminController {
         this.adminEndpoint = adminEndpoint;
         this.authEndpoint = authEndpoint;
     }
+
     /**
      * Helper method that checks if the current request is from an authenticated admin.
      * If valid, returns the username wrapped in 200 OK; otherwise returns 401/403 with a message.

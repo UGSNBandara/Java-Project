@@ -31,11 +31,12 @@ public class AuthService {
     private final OAuthService oAuthService;
     private final RoleRepository roleRepository;
     private final RefreshTokenRepository refreshTokenRepository;
+    private final AuditEventRepository auditEventRepository;
     private final Set<String> blacklistedTokens = new HashSet<>();
 
     @Autowired
     public AuthService(JwtService jwtService, UserService userService, UserRepository userRepository,
-                       BCryptPasswordEncoder passwordEncoder, EmailUtil emailUtil, EmailTokenRepository emailTokenRepository, OauthProviderRepository oauthProviderRepository, OAuthService oAuthService, RoleRepository roleRepository, RefreshTokenRepository refreshTokenRepository) {
+                       BCryptPasswordEncoder passwordEncoder, EmailUtil emailUtil, EmailTokenRepository emailTokenRepository, OauthProviderRepository oauthProviderRepository, OAuthService oAuthService, RoleRepository roleRepository, RefreshTokenRepository refreshTokenRepository, AuditEventRepository auditEventRepository) {
         this.jwtService = jwtService;
         this.userService = userService;
         this.userRepository = userRepository;
@@ -46,6 +47,7 @@ public class AuthService {
         this.oAuthService = oAuthService;
         this.roleRepository = roleRepository;
         this.refreshTokenRepository = refreshTokenRepository;
+        this.auditEventRepository = auditEventRepository;
     }
 
     /**
@@ -55,6 +57,24 @@ public class AuthService {
      * @return true if registration was successful, false otherwise.
      */
     public UserResponse registerUser(RegisterRequest request) {
+        // Validate input
+        if (request.getUsername() == null || request.getUsername().trim().isEmpty()) {
+            throw new IllegalArgumentException("Username is required");
+        }
+        if (request.getEmail() == null || !request.getEmail().matches("[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}")) {
+            throw new IllegalArgumentException("Invalid email format");
+        }
+        if (request.getPassword() == null || request.getPassword().length() < 8) {
+            throw new IllegalArgumentException("Password must be at least 8 characters long");
+        }
+
+        // Check if user already exists
+        if (userRepository.findByEmail(request.getEmail()).isPresent()) {
+            throw new IllegalArgumentException("Email already registered");
+        }
+        if (userRepository.findByUsername(request.getUsername()).isPresent()) {
+            throw new IllegalArgumentException("Username already taken");
+        }
 
         List<Role> roles = roleRepository.findByName("ROLE_USER");
         if (roles.isEmpty()) {
@@ -62,22 +82,38 @@ public class AuthService {
         }
         Role userRole = roles.get(0);
 
-        User user = new User();
-        user.setUsername(request.getUsername());
-        user.setEmail(request.getEmail());
-        user.setPassword(passwordEncoder.encode(request.getPassword()));
-        user.setActive(true);
-        user.setCreatedAt(new java.sql.Timestamp(System.currentTimeMillis()));
+        User user = User.builder()
+                .username(request.getUsername())
+                .email(request.getEmail())
+                .password(passwordEncoder.encode(request.getPassword()))
+                .isActive(true)
+                .isLocked(false)
+                .createdAt(new java.sql.Timestamp(System.currentTimeMillis()))
+                .userRoles(new HashSet<>())
+                .build();
 
-        UserRole userRoleMapping = new UserRole();
-        userRoleMapping.setUser(new User());
-        userRoleMapping.setRole(userRole);
+        UserRole userRoleMapping = UserRole.builder()
+                .user(user)
+                .role(userRole)
+                .build();
         user.getUserRoles().add(userRoleMapping);
 
-        userRepository.save(new User());
-        List<String> permissionNames = new ArrayList<>();
+        user = userRepository.save(user);
+        List<String> permissionNames = userRepository.findPermissionNamesByUsername(user.getUsername());
 
-        return UserResponse.fromEntity(new User(), permissionNames);
+        // Log user registration
+        auditEventRepository.save(AuditEvent.builder()
+                .eventType("USER_REGISTRATION")
+                .userId(user.getId())
+                .username(user.getUsername())
+                .ipAddress(request.getIp())
+                .userAgent(request.getUserAgent())
+                .description("User registered successfully")
+                .success(true)
+                .authenticationMethod("LOCAL")
+                .build());
+
+        return UserResponse.fromEntity(user, permissionNames);
     }
 
 
@@ -88,20 +124,65 @@ public class AuthService {
      * @return Access token if authentication is successful, null otherwise.
      */
     public TokenResponse authenticateUser(LoginRequest request) {
+        // Check if token is blacklisted
+        String token = extractTokenFromHeader(request);
+        if (token != null && isBlacklisted(token)) {
+            throw new SecurityException("Token has been blacklisted");
+        }
+
         Optional<User> userOptional = userRepository.findByEmail(request.getEmail());
         if (userOptional.isPresent()) {
             User user = userOptional.get();
-            if (request.getPassword().equals(user.getPassword())) {
-                UserResponse userResponse = userService.loadUserByUsername(user.getEmail());
+            
+            // Check if account is active and not locked
+            if (!user.isActive()) {
+                throw new SecurityException("Account is deactivated");
+            }
+            if (user.isLocked()) {
+                throw new SecurityException("Account is locked");
+            }
+
+            // Verify password using password encoder
+            if (passwordEncoder.matches(request.getPassword(), user.getPassword())) {
+                // Load user details and permissions first
+                UserResponse userResponse = userService.loadUserByUsername(user.getUsername());
                 List<String> permissionNames = userRepository.findPermissionNamesByUsername(user.getUsername());
                 userResponse.setPermissions(permissionNames);
+
+                // Generate tokens
                 String accessToken = jwtService.generateAccessToken(userResponse);
                 String refreshToken = jwtService.generateRefreshToken(userResponse);
                 saveRefreshToken(user, refreshToken);
+
+                // Log successful login
+                auditEventRepository.save(AuditEvent.builder()
+                        .eventType("LOGIN_SUCCESS")
+                        .userId(user.getId())
+                        .username(user.getUsername())
+                        .ipAddress(request.getIp())
+                        .userAgent(request.getUserAgent())
+                        .description("User logged in successfully")
+                        .success(true)
+                        .authenticationMethod("LOCAL")
+                        .build());
+
                 return new TokenResponse(accessToken, refreshToken);
             }
         }
-        return null;
+
+        // Log failed login attempt
+        auditEventRepository.save(AuditEvent.builder()
+                .eventType("LOGIN_ATTEMPT")
+                .userId(request.getEmail())
+                .username(request.getEmail())
+                .ipAddress(request.getIp())
+                .userAgent(request.getUserAgent())
+                .description("Invalid credentials")
+                .success(false)
+                .authenticationMethod("LOCAL")
+                .build());
+
+        throw new SecurityException("Invalid credentials");
     }
 
     /**
@@ -112,43 +193,81 @@ public class AuthService {
      */
     public TokenResponse authenticateOAuth(OAuthRequest request) {
         if ("github".equalsIgnoreCase(request.getProvider())) {
-            String oAuthAccessToken = oAuthService.getGithubAccessToken(request.getOauthToken());
-            Map<String, Object> githubUser = oAuthService.getGithubUser(oAuthAccessToken);
-
-            String githubId = githubUser.get("id").toString();
-            String githubEmail = (String) githubUser.get("email");
-            String githubLogin = (String) githubUser.get("login");
-
-            Optional<OauthProvider> providerOpt = oauthProviderRepository.findByProviderAndExternalUserId("github", githubId);
-            User user;
-            if (providerOpt.isPresent()) {
-                user = providerOpt.get().getUser();
-            } else {
-                Optional<User> existingUserOpt = userRepository.findByEmail(githubEmail);
-                if (existingUserOpt.isPresent()) {
-                    user = existingUserOpt.get();
-                } else {
-                    user = User.builder()
-                            .username(githubLogin)
-                            .email(githubEmail)
-                            .isActive(true)
-                            .isLocked(false)
-                            .userRoles(new HashSet<>())
-                            .build();
-                    user = userRepository.save(user);
-                }
-                oauthProviderRepository.save(OauthProvider.builder()
-                        .provider("github")
-                        .externalUserId(githubId)
-                        .user(user)
-                        .build());
+            // Check for blacklisted tokens
+            String token = extractTokenFromHeader(request);
+            if (token != null && isBlacklisted(token)) {
+                throw new SecurityException("Token has been blacklisted");
             }
 
-            UserResponse userResponse = userService.loadUserByUsername(user.getEmail());
-            String accessToken = jwtService.generateAccessToken(userResponse);
-            String refreshToken = jwtService.generateRefreshToken(userResponse);
+            try {
+                String oAuthAccessToken = oAuthService.getGithubAccessToken(request.getOauthToken());
+                Map<String, Object> githubUser = oAuthService.getGithubUser(oAuthAccessToken);
 
-            return new TokenResponse(accessToken, refreshToken);
+                // Validate required GitHub user information
+                if (githubUser == null || 
+                    githubUser.get("id") == null || 
+                    githubUser.get("email") == null || 
+                    githubUser.get("login") == null) {
+                    throw new RuntimeException("Invalid GitHub user profile");
+                }
+
+                String githubId = githubUser.get("id").toString();
+                String githubEmail = (String) githubUser.get("email");
+                String githubLogin = (String) githubUser.get("login");
+
+                Optional<OauthProvider> providerOpt = oauthProviderRepository.findByProviderAndExternalUserId("github", githubId);
+                User user;
+                if (providerOpt.isPresent()) {
+                    user = providerOpt.get().getUser();
+                } else {
+                    Optional<User> existingUserOpt = userRepository.findByEmail(githubEmail);
+                    if (existingUserOpt.isPresent()) {
+                        user = existingUserOpt.get();
+                    } else {
+                        // Create new user with default role
+                        List<Role> roles = roleRepository.findByName("ROLE_USER");
+                        if (roles.isEmpty()) {
+                            throw new RuntimeException("Default role not found: ROLE_USER");
+                        }
+                        Role userRole = roles.get(0);
+
+                        user = User.builder()
+                                .username(githubLogin)
+                                .email(githubEmail)
+                                .isActive(true)
+                                .isLocked(false)
+                                .userRoles(new HashSet<>())
+                                .build();
+
+                        UserRole userRoleMapping = UserRole.builder()
+                                .user(user)
+                                .role(userRole)
+                                .build();
+                        user.getUserRoles().add(userRoleMapping);
+
+                        user = userRepository.save(user);
+                    }
+                    
+                    // Save OAuth provider information
+                    oauthProviderRepository.save(OauthProvider.builder()
+                            .provider("github")
+                            .externalUserId(githubId)
+                            .user(user)
+                            .build());
+                }
+
+                // Load user details using username
+                UserResponse userResponse = userService.loadUserByUsername(user.getUsername());
+                
+                // Generate tokens
+                String accessToken = jwtService.generateAccessToken(userResponse);
+                String refreshToken = jwtService.generateRefreshToken(userResponse);
+                saveRefreshToken(user, refreshToken);
+
+                return new TokenResponse(accessToken, refreshToken);
+            } catch (Exception e) {
+                throw new RuntimeException("GitHub OAuth authentication failed: " + e.getMessage(), e);
+            }
         }
 
         return null;
@@ -290,6 +409,11 @@ public class AuthService {
      * @param token The refresh token to be saved.
      */
     private void saveRefreshToken(User user, String token) {
+        // Clean up expired tokens for this user
+        refreshTokenRepository.deleteByUserAndExpiresAtBefore(
+            user, 
+            new Timestamp(System.currentTimeMillis())
+        );
 
         RefreshToken refreshToken = RefreshToken.builder()
                 .user(user)
@@ -309,30 +433,53 @@ public class AuthService {
      * @throws RuntimeException if the refresh token is expired or invalid.
      */
     public TokenResponse refreshToken(String refreshToken) {
+        // First check if token is blacklisted
+        if (isBlacklisted(refreshToken)) {
+            throw new RuntimeException("Refresh token has been blacklisted");
+        }
 
+        // Check if token exists in database
         RefreshToken tokenRecord = refreshTokenRepository.findByToken(refreshToken)
                 .orElseThrow(() -> new RuntimeException("Refresh token not found"));
 
-        if (tokenRecord.isRevoked() || tokenRecord.getExpiresAt().before(new Timestamp(System.currentTimeMillis()))) {
-            throw new RuntimeException("Refresh token is expired or revoked");
+        // Check if token is expired
+        if (tokenRecord.getExpiresAt().before(new Timestamp(System.currentTimeMillis()))) {
+            throw new RuntimeException("Refresh token has expired");
         }
 
+        // Check if token is revoked
+        if (tokenRecord.isRevoked()) {
+            throw new RuntimeException("Refresh token has been revoked");
+        }
+
+        // Validate JWT token
         if (!jwtService.isTokenValid(refreshToken)) {
             throw new RuntimeException("Invalid refresh token");
         }
 
+        // Get user details
         String username = jwtService.extractUsername(refreshToken);
         User user = userRepository.findByUsername(username)
                 .orElseThrow(() -> new RuntimeException("User not found"));
 
+        // Generate new tokens
         List<String> permissionNames = userRepository.findPermissionNamesByUsername(user.getUsername());
-
         UserResponse userDetails = UserResponse.fromEntity(user, permissionNames);
 
         String newAccessToken = jwtService.generateAccessToken(userDetails);
         String newRefreshToken = jwtService.generateRefreshToken(userDetails);
 
-        return TokenResponse.builder().accessToken(newAccessToken).refreshToken(newRefreshToken).build();
+        // Revoke old refresh token
+        tokenRecord.setRevoked(true);
+        refreshTokenRepository.save(tokenRecord);
+
+        // Save new refresh token
+        saveRefreshToken(user, newRefreshToken);
+
+        return TokenResponse.builder()
+                .accessToken(newAccessToken)
+                .refreshToken(newRefreshToken)
+                .build();
     }
 
     /**
